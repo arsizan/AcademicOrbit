@@ -135,6 +135,8 @@ export function makeDb() {
       workspaces: [], workspace_members: [], workspace_tasks: [], workspace_files: [], workspace_milestones: [],
       workspace_meetings: [], workspace_recordings: [], workspace_updates: [],
       search_events: [], profile_view_events: [],
+      // 14 Nov 2026: "Delete for me"
+      message_hidden: [],
       // The signed-in test user accepted the current Terms already.
       user_consents: [{ user_id: U, terms_version: TERMS_VERSION, accepted_at: iso(1) }],
     },
@@ -178,6 +180,8 @@ function test(row, col, expr) {
       const parts = splitTop(val.replace(/^\(|\)$/g, ''));
       return parts.every((p) => { const [c, ...e] = p.split('.'); return test(row, c, e.join('.')); });
     }
+    // 14 Nov 2026: e.g. pinned_at=not.is.null
+    case 'not': return !test(row, col, val);
     default: return true;
   }
 }
@@ -244,8 +248,10 @@ class PgError extends Error {
 const userError = (message) => new PgError('P0001', message);
 
 function summaries(db) {
+  // 14 Nov 2026: messages I deleted for myself are left out.
+  const hidden = new Set(db.tables.message_hidden.filter((h) => h.user_id === db.U).map((h) => h.message_id));
   return db.tables.conversation_members.filter((m) => m.user_id === db.U).map((m) => {
-    const live = db.tables.messages.filter((x) => x.conversation_id === m.conversation_id && !x.is_deleted);
+    const live = db.tables.messages.filter((x) => x.conversation_id === m.conversation_id && !x.is_deleted && !hidden.has(x.id));
     const unread = live.filter((x) => x.sender_id !== m.user_id && (!m.last_read_at || x.created_at > m.last_read_at)).length;
     const last = live.slice().sort((a, b) => (a.created_at < b.created_at ? 1 : -1))[0];
     const preview = last ? (last.body || last.message_text || (last.attachment_kind === 'voice' ? 'Voice message' : last.attachment_name ? `File: ${last.attachment_name}` : null)) : null;
@@ -305,6 +311,41 @@ function rpc(db, fn, args) {
   switch (fn) {
     case 'my_conversation_summaries':
       return summaries(db);
+    // 14 Nov 2026: message actions (20261114000000_message_actions.sql)
+    case 'edit_message': {
+      const m = t.messages.find((x) => x.id === args.p_message_id && !x.is_deleted);
+      if (!m) throw new PgError('P0002', 'This message no longer exists.');
+      if (m.sender_id !== db.U) throw new PgError('42501', 'You can only edit your own messages.');
+      if (Date.now() - new Date(m.created_at).getTime() > 5 * 60 * 1000) throw userError('A message can only be edited in the first 5 minutes.');
+      const body = String(args.p_body ?? '').trim();
+      if (!body && !m.attachment_path) throw userError('A message needs text.');
+      Object.assign(m, { body: body || null, message_text: body || null, edited_at: now, updated_at: now });
+      return null;
+    }
+    case 'delete_message_for_everyone': {
+      const m = t.messages.find((x) => x.id === args.p_message_id && !x.is_deleted);
+      if (!m) return null;
+      if (m.sender_id !== db.U) throw new PgError('42501', 'You can only delete your own messages for everyone.');
+      const path = m.attachment_path;
+      Object.assign(m, { is_deleted: true, deleted_at: now, body: null, message_text: null, attachment_path: null, attachment_name: null, attachment_type: null, attachment_size: null, attachment_kind: null, attachment_duration_seconds: null, pinned_at: null, pinned_by: null, updated_at: now });
+      return path;
+    }
+    case 'hide_message_for_me': {
+      const m = t.messages.find((x) => x.id === args.p_message_id);
+      const member = m && t.conversation_members.some((c) => c.conversation_id === m.conversation_id && c.user_id === db.U);
+      if (!member) throw new PgError('P0002', 'This message no longer exists.');
+      if (!t.message_hidden.some((h) => h.user_id === db.U && h.message_id === m.id)) {
+        t.message_hidden.push({ user_id: db.U, message_id: m.id, conversation_id: m.conversation_id, hidden_at: now });
+      }
+      return null;
+    }
+    case 'set_message_pinned': {
+      const m = t.messages.find((x) => x.id === args.p_message_id && !x.is_deleted);
+      const member = m && t.conversation_members.some((c) => c.conversation_id === m.conversation_id && c.user_id === db.U);
+      if (!member) throw new PgError('P0002', 'This message no longer exists.');
+      Object.assign(m, { pinned_at: args.p_pinned ? now : null, pinned_by: args.p_pinned ? db.U : null, updated_at: now });
+      return null;
+    }
     case 'readable_post_texts': {
       const ids = new Set(args.content_ids || []);
       return t.contents.filter((c) => ids.has(c.id) && ((c.visibility_mode || 'public') === 'public' || c.user_id === db.U)).map((c) => ({ content_id: c.id, content: c.content }));

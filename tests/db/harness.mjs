@@ -22,6 +22,8 @@ export const MIGRATIONS = [
   '20261017000000_phase5.sql',
   // 9 Nov 2026: AcademicOrbit rename
   '20261110000000_academicorbit_rename.sql',
+  // 14 Nov 2026: edit, delete for me / everyone, pin
+  '20261114000000_message_actions.sql',
 ];
 
 const SETUP = `

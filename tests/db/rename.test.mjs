@@ -10,7 +10,8 @@ let passed = 0;
 const ok = () => { passed += 1; };
 
 const RENAME = '20261110000000_academicorbit_rename.sql';
-assert.equal(MIGRATIONS[MIGRATIONS.length - 1], RENAME);
+// 14 Nov 2026: no longer the last migration (message actions came after it)
+assert.ok(MIGRATIONS.includes(RENAME));
 
 // The database as it is in production before the rename.
 const OLD = 'Research' + 'Gram'; // spelled in two parts so a search for the old name finds only real leftovers
