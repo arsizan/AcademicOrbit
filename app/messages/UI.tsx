@@ -23,9 +23,12 @@ import {
   Paperclip,
   Square,
   UserRound,
+  Pin, // 14 Nov 2026: pinned mark next to a message's time
 } from "lucide-react";
 import type { VoiceNote } from "./useVoiceRecorder";
 import { MAX_VOICE_SECONDS } from "./useVoiceRecorder";
+// 14 Nov 2026: edit, delete for me / everyone, pin
+import { MessageEditor, MessageMenu, PinnedBar, isSavedMessage, messageElementId } from "./MessageActions";
 
 // ─── Types (preserved verbatim) ──────────────────────────────────────────────
 
@@ -69,6 +72,10 @@ export type MessageRow = {
   attachment_duration_seconds?: number | null;
   /** Short-lived signed link to the attachment (private bucket). */
   attachment_url?: string | null;
+  // 14 Nov 2026: message actions
+  edited_at?: string | null;
+  pinned_at?: string | null;
+  pinned_by?: string | null;
 };
 
 /** A file chosen for the next message (voice messages come from useVoiceRecorder). */
@@ -169,6 +176,12 @@ type MessagesUIProps = {
   handleAttachmentLinkFailed?: (path: string) => void;
   handleToggleMute?: (conversationId: string) => void;
   handleOpenProfile?: (profileId: string) => void;
+  // 14 Nov 2026: message actions (MessageActions.tsx)
+  handleEditMessage?: (message: MessageRow, text: string) => Promise<boolean>;
+  handleDeleteMessage?: (message: MessageRow, forEveryone: boolean) => void;
+  handleTogglePin?: (message: MessageRow) => void;
+  /** The open chat's pinned messages, oldest pin first. */
+  pinnedMessages?: MessageRow[];
 };
 
 // ─── Constants (preserved verbatim) ──────────────────────────────────────────
@@ -635,7 +648,29 @@ export default function MessagesUI({
   handleAttachmentLinkFailed,
   handleToggleMute,
   handleOpenProfile,
+  // 14 Nov 2026: message actions
+  handleEditMessage,
+  handleDeleteMessage,
+  handleTogglePin,
+  pinnedMessages = [],
 }: MessagesUIProps) {
+  // 14 Nov 2026: the message being edited; closed when another chat is opened.
+  const [editingMessageId, setEditingMessageId] = useState("");
+  const [savingEdit, setSavingEdit] = useState(false);
+  const [editingChatId, setEditingChatId] = useState(selectedConversationId);
+  if (editingChatId !== selectedConversationId) {
+    setEditingChatId(selectedConversationId);
+    setEditingMessageId("");
+  }
+  const hasMessageActions = Boolean(handleDeleteMessage && handleTogglePin);
+
+  const saveEdit = async (message: MessageRow, text: string) => {
+    if (!handleEditMessage || savingEdit) return;
+    setSavingEdit(true);
+    const done = await handleEditMessage(message, text);
+    setSavingEdit(false);
+    if (done) setEditingMessageId("");
+  };
   const fileInputRef = useRef<HTMLInputElement>(null);
   const hasAttachment = Boolean(pendingFile || voiceNote);
   const voiceBusy = voiceRecording || voiceStarting;
@@ -1213,10 +1248,21 @@ const messageStream: StreamItem[] = useMemo(() => {
                   </div>
                 </div>
 
+                {/* 14 Nov 2026: pinned messages of this chat */}
+                {handleTogglePin && (
+                  <PinnedBar
+                    key={selectedConversation.id}
+                    pinned={pinnedMessages.filter((m) => m.conversation_id === selectedConversation.id)}
+                    onUnpin={handleTogglePin}
+                  />
+                )}
+
                 {/* Messages area */}
                 <div
                   ref={messagesScrollRef}
                   onScroll={rememberScrollPosition}
+                  // 14 Nov 2026: the message menus stay inside this area
+                  data-message-scroll=""
                   // 10 Nov 2026: room at the end (pb-20) so the newest message
                   // scrolls clear of the assistant's round button above the message box
                   className="flex-1 overflow-y-auto px-4 pt-4 pb-20 space-y-4 [&::-webkit-scrollbar]:hidden"
@@ -1269,10 +1315,14 @@ const messageStream: StreamItem[] = useMemo(() => {
                         userId
                       );
 
+                      // 14 Nov 2026: edit / delete / pin
+                      const editing = editingMessageId === msg.id;
+
                       return (
                         <div
                           key={item.key}
-                          className={`flex items-end gap-2.5 ${mine ? "flex-row-reverse" : "flex-row"}`}
+                          id={messageElementId(msg.id)}
+                          className={`group/message flex items-end gap-2.5 rounded-xl ${mine ? "flex-row-reverse" : "flex-row"}`}
                         >
                           {!mine && (
                             <Avatar
@@ -1282,30 +1332,65 @@ const messageStream: StreamItem[] = useMemo(() => {
                             />
                           )}
 
-                          <div className={`max-w-[75%] flex flex-col gap-1 ${mine ? "items-end" : "items-start"}`}>
+                          {/* 14 Nov 2026: wider while the message is edited */}
+                          <div
+                            className={`flex flex-col gap-1 ${mine ? "items-end" : "items-start"} ${
+                              editing ? "w-full max-w-[85%] sm:max-w-md" : "max-w-[75%]"
+                            }`}
+                          >
                             {!mine && !isDirect && (
                               <p className="text-[11px] text-muted-foreground font-semibold px-1">
                                 {senderName}
                               </p>
                             )}
-                            <div
-                              className={`px-4 py-2.5 rounded-2xl text-sm leading-relaxed shadow-sm break-words ${
-                                mine
-                                  ? "bg-primary text-white rounded-br-sm"
-                                  : "bg-card border border-border text-foreground rounded-bl-sm"
-                              }`}
-                            >
-                              {msg.attachment_path && (
-                                <div className={msg.body ? "mb-2" : ""}>
-                                  <MessageAttachment message={msg} mine={mine} onLinkFailed={handleAttachmentLinkFailed} />
-                                </div>
+                            {/* 14 Nov 2026: the editor takes the bubble's place while editing */}
+                            {editing ? (
+                              <MessageEditor
+                                initialText={msg.body || ""}
+                                saving={savingEdit}
+                                onSave={(text) => saveEdit(msg, text)}
+                                onCancel={() => setEditingMessageId("")}
+                              />
+                            ) : (
+                              <div
+                                className={`px-4 py-2.5 rounded-2xl text-sm leading-relaxed shadow-sm break-words ${
+                                  mine
+                                    ? "bg-primary text-white rounded-br-sm"
+                                    : "bg-card border border-border text-foreground rounded-bl-sm"
+                                }`}
+                              >
+                                {msg.attachment_path && (
+                                  <div className={msg.body ? "mb-2" : ""}>
+                                    <MessageAttachment message={msg} mine={mine} onLinkFailed={handleAttachmentLinkFailed} />
+                                  </div>
+                                )}
+                                {msg.body && <p className="whitespace-pre-wrap">{msg.body}</p>}
+                              </div>
+                            )}
+                            <p className="text-[10px] text-muted-foreground px-1 flex items-center gap-1">
+                              {/* 14 Nov 2026: pinned / edited marks */}
+                              {msg.pinned_at && (
+                                <>
+                                  <Pin className="w-3 h-3 text-amber-700" aria-hidden="true" />
+                                  <span className="sr-only">Pinned. </span>
+                                </>
                               )}
-                              {msg.body && <p className="whitespace-pre-wrap">{msg.body}</p>}
-                            </div>
-                            <p className="text-[10px] text-muted-foreground px-1">
                               {formatTime(msg.created_at)}
+                              {msg.edited_at && <span>· Edited</span>}
                             </p>
                           </div>
+
+                          {/* 14 Nov 2026: the "..." menu (not while sending or editing) */}
+                          {hasMessageActions && !editing && isSavedMessage(msg) && (
+                            <MessageMenu
+                              message={msg}
+                              userId={userId}
+                              onEdit={() => setEditingMessageId(msg.id)}
+                              onTogglePin={() => handleTogglePin?.(msg)}
+                              onDeleteForMe={() => handleDeleteMessage?.(msg, false)}
+                              onDeleteForEveryone={() => handleDeleteMessage?.(msg, true)}
+                            />
+                          )}
                         </div>
                       );
                     })

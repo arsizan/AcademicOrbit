@@ -14,9 +14,11 @@ import MessagesUI, {
   type TypingUser,
 } from "./UI";
 import { logDev } from "@/lib/log";
-import { friendlyError, isUnclearFailure, notify } from "@/lib/feedback";
+// 14 Nov 2026: + confirmAction (deleting a message asks first)
+import { confirmAction, friendlyError, isUnclearFailure, notify } from "@/lib/feedback";
 import { asUploadBody, chatUploadProblem, IMAGE_TYPES } from "@/lib/uploadRules";
 import { useVoiceRecorder } from "./useVoiceRecorder";
+import { canEditMessage } from "./MessageActions"; // 14 Nov 2026
 
 type ConversationRow = {
   id: string;
@@ -70,8 +72,13 @@ const SIGNED_URL_SECONDS = 60 * 60;
 // it fails to load (refreshAttachmentUrl).
 const SIGNED_URL_REUSE_MS = (SIGNED_URL_SECONDS - 5 * 60) * 1000;
 
-const MESSAGE_FIELDS =
-  "id, conversation_id, sender_id, body, read_at, is_deleted, created_at, attachment_path, attachment_name, attachment_type, attachment_size, attachment_kind, attachment_duration_seconds";
+// 14 Nov 2026: + pinned_at (pinned messages) and edited_at (edited messages).
+// edited_at comes with supabase/migrations/20261114000000_message_actions.sql;
+// until that has been run in Supabase the chat asks without it, so it still loads.
+const MESSAGE_FIELDS_WITHOUT_EDITS =
+  "id, conversation_id, sender_id, body, read_at, is_deleted, created_at, attachment_path, attachment_name, attachment_type, attachment_size, attachment_kind, attachment_duration_seconds, pinned_at";
+const MESSAGE_FIELDS = `${MESSAGE_FIELDS_WITHOUT_EDITS}, edited_at`;
+const MAX_PINNED = 20;
 
 function safeFileName(name: string) {
   return name.replace(/[^a-zA-Z0-9._-]/g, "_").slice(-120) || "file";
@@ -126,6 +133,8 @@ export default function MessagesClient() {
   const [conversations, setConversations] = useState<ConversationView[]>([]);
   const [selectedConversationId, setSelectedConversationId] = useState("");
   const [messages, setMessages] = useState<MessageRow[]>([]);
+  // 14 Nov 2026: the open chat's pinned messages (also older ones not loaded yet)
+  const [pinnedMessages, setPinnedMessages] = useState<MessageRow[]>([]);
 
   // "Show more" in the chat list and "Load older messages" in a chat (audit RG-17).
   const [conversationListLimit, setConversationListLimit] = useState(
@@ -779,7 +788,10 @@ export default function MessagesClient() {
       keepMessagesOnError = false,
     ) => {
       if (!conversationId || !currentUserId) {
-        if (isMountedRef.current) setMessages([]);
+        if (isMountedRef.current) {
+          setMessages([]);
+          setPinnedMessages([]); // 14 Nov 2026
+        }
         return;
       }
 
@@ -793,16 +805,45 @@ export default function MessagesClient() {
           : MESSAGE_PAGE_SIZE;
 
       // One extra row tells us whether anything older exists.
-      const { data, error } = await supabase
-        .from("messages")
-        .select(MESSAGE_FIELDS)
-        .eq("conversation_id", conversationId)
-        .eq("is_deleted", false)
-        .order("created_at", { ascending: false })
-        .limit(limit + 1);
+      // 14 Nov 2026: the pinned messages come along, and the ones I deleted
+      // for myself are left out.
+      const fetchMessages = (fields: string) =>
+        Promise.all([
+          supabase
+            .from("messages")
+            .select(fields)
+            .eq("conversation_id", conversationId)
+            .eq("is_deleted", false)
+            .order("created_at", { ascending: false })
+            .limit(limit + 1),
+          supabase
+            .from("messages")
+            .select(fields)
+            .eq("conversation_id", conversationId)
+            .eq("is_deleted", false)
+            .not("pinned_at", "is", null)
+            .order("pinned_at", { ascending: false })
+            .limit(MAX_PINNED),
+          supabase.from("message_hidden").select("message_id").eq("conversation_id", conversationId),
+        ]);
 
-      const rows = (data || []) as MessageRow[];
-      const safeMessages = error ? [] : await withAttachmentUrls(rows.slice(0, limit).reverse());
+      let [page, pinnedPage, hiddenPage] = await fetchMessages(MESSAGE_FIELDS);
+      // 42703 = unknown column: the message actions SQL has not been run yet.
+      if (page.error?.code === "42703") {
+        [page, pinnedPage, hiddenPage] = await fetchMessages(MESSAGE_FIELDS_WITHOUT_EDITS);
+      }
+      const { data, error } = page;
+      const hidden = new Set(
+        hiddenPage.error ? [] : ((hiddenPage.data || []) as { message_id: string }[]).map((row) => row.message_id),
+      );
+      const visible = (row: MessageRow) => !hidden.has(row.id);
+      // The newest pins, shown oldest first.
+      const pinnedRows = pinnedPage.error
+        ? []
+        : ((pinnedPage.data || []) as unknown as MessageRow[]).filter(visible).reverse();
+
+      const rows = (data || []) as unknown as MessageRow[];
+      const safeMessages = error ? [] : await withAttachmentUrls(rows.slice(0, limit).filter(visible).reverse());
 
       // An older reply, or one for a chat that is no longer open, must not
       // replace what is on screen.
@@ -818,7 +859,10 @@ export default function MessagesClient() {
           notify(friendlyError(error, "Could not load the messages."), "error");
         }
 
-        if (isCurrent && !keepMessagesOnError) setMessages([]);
+        if (isCurrent && !keepMessagesOnError) {
+          setMessages([]);
+          setPinnedMessages([]); // 14 Nov 2026
+        }
         return;
       }
 
@@ -829,6 +873,7 @@ export default function MessagesClient() {
           messageLimitRef.current = limit;
         }
         setMessages(safeMessages);
+        setPinnedMessages(pinnedRows); // 14 Nov 2026
         setHasOlderMessages(rows.length > limit);
       }
 
@@ -1146,6 +1191,102 @@ export default function MessagesClient() {
     window.dispatchEvent(new Event("academicorbit:refresh-nav-counts"));
   };
 
+  // ─── 14 Nov 2026: message actions (edit, delete for me / everyone, pin) ───
+  // The database checks every rule again (20261114000000_message_actions.sql).
+
+  const reloadOpenChat = async (conversationId: string) => {
+    if (!userId || selectedConversationIdRef.current !== conversationId) return;
+    await loadMessages(conversationId, userId, true);
+  };
+
+  /** Resolves true when the editor can close (saved, or no longer editable). */
+  const handleEditMessage = async (message: MessageRow, text: string) => {
+    const body = text.trim();
+    if (!body) return false;
+    if (!canEditMessage(message, userId)) {
+      notify("A message can only be edited in the first 5 minutes.", "info");
+      return true;
+    }
+
+    const { error } = await supabase.rpc("edit_message", { p_message_id: message.id, p_body: body });
+
+    if (error) {
+      logDev("EDIT MESSAGE ERROR:", error);
+      notify(friendlyError(error, "Could not edit the message."), "error");
+      // The text stays in the box when the connection failed, to try again.
+      return !isUnclearFailure(error);
+    }
+
+    const edit = (row: MessageRow) =>
+      row.id === message.id ? { ...row, body, edited_at: new Date().toISOString() } : row;
+    setMessages((rows) => rows.map(edit));
+    setPinnedMessages((rows) => rows.map(edit));
+    await reloadOpenChat(message.conversation_id);
+    return true;
+  };
+
+  const handleDeleteMessage = async (message: MessageRow, forEveryone: boolean) => {
+    const confirmed = await confirmAction(
+      forEveryone
+        ? {
+            title: "Delete for everyone?",
+            message: "This message will be removed for everyone in this chat. This cannot be undone.",
+            confirmLabel: "Delete for everyone",
+            tone: "danger",
+          }
+        : {
+            title: "Delete for you?",
+            message: "This message will be removed from this chat for you only. The others in the chat will still see it.",
+            confirmLabel: "Delete for me",
+            tone: "danger",
+          },
+    );
+    if (!confirmed) return;
+
+    const { data, error } = forEveryone
+      ? await supabase.rpc("delete_message_for_everyone", { p_message_id: message.id })
+      : await supabase.rpc("hide_message_for_me", { p_message_id: message.id });
+
+    if (error) {
+      logDev("DELETE MESSAGE ERROR:", error);
+      notify(friendlyError(error, "Could not delete the message."), "error");
+      return;
+    }
+
+    setMessages((rows) => rows.filter((row) => row.id !== message.id));
+    setPinnedMessages((rows) => rows.filter((row) => row.id !== message.id));
+    notify(forEveryone ? "Message deleted for everyone." : "Message deleted for you.", "success");
+
+    // A file or voice message deleted for everyone is removed from storage too.
+    if (forEveryone && typeof data === "string" && data) {
+      const { error: removeError } = await supabase.storage.from(CHAT_BUCKET).remove([data]);
+      if (removeError) logDev("REMOVE CHAT FILE ERROR:", removeError);
+    }
+
+    await reloadOpenChat(message.conversation_id);
+    // The chat list shows the new last message.
+    if (userId) await loadConversationsRef.current(userId, true);
+  };
+
+  const handleTogglePin = async (message: MessageRow) => {
+    const pin = !message.pinned_at;
+    const { error } = await supabase.rpc("set_message_pinned", { p_message_id: message.id, p_pinned: pin });
+
+    if (error) {
+      logDev("PIN MESSAGE ERROR:", error);
+      notify(friendlyError(error, pin ? "Could not pin the message." : "Could not unpin the message."), "error");
+      return;
+    }
+
+    const pinnedAt = pin ? new Date().toISOString() : null;
+    setMessages((rows) => rows.map((row) => (row.id === message.id ? { ...row, pinned_at: pinnedAt } : row)));
+    setPinnedMessages((rows) => {
+      const others = rows.filter((row) => row.id !== message.id);
+      return pin ? [...others, { ...message, pinned_at: pinnedAt }] : others;
+    });
+    await reloadOpenChat(message.conversation_id);
+  };
+
   // Text, a file, a voice message, or text with one of them. The chat moves
   // to the top by itself: the database does that when the message is saved
   // (audit RG-20).
@@ -1401,6 +1542,11 @@ export default function MessagesClient() {
       handleAttachmentLinkFailed={refreshAttachmentUrl}
       handleToggleMute={handleToggleMute}
       handleOpenProfile={(profileId) => router.push(`/researchers/${profileId}`)}
+      // 14 Nov 2026: message actions
+      handleEditMessage={handleEditMessage}
+      handleDeleteMessage={handleDeleteMessage}
+      handleTogglePin={handleTogglePin}
+      pinnedMessages={pinnedMessages}
     />
   );
 }
